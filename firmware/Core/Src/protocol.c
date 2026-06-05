@@ -1,0 +1,363 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file    protocol.c
+  * @brief   UART DMA protocol parser and frame builder.
+  *
+  * Supports:
+  *   - Binary frame protocol (see COMM_PROTOCOL.md)
+  *   - FireWater-style text commands for VOFA tuning
+  *   - VOFA JustFloat waveform output
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+#include "protocol.h"
+#include <string.h>
+#include <stdio.h>
+
+#define FRAME_SOF0  0xAA
+#define FRAME_SOF1  0x55
+
+#if !PROTOCOL_VOFA_ONLY
+static uint8_t CalcChecksum(uint8_t *data, uint16_t len)
+{
+    uint8_t sum = 0;
+    for (uint16_t i = 0; i < len; i++) {
+        sum += data[i];
+    }
+    return sum;
+}
+#endif
+
+static void Protocol_EnqueueCmd(Protocol_t *proto, ProtocolCmd_t *pcmd)
+{
+    uint8_t w = (proto->cmd_write_idx + 1) % PROTOCOL_CMD_QUEUE_SIZE;
+    if (w != proto->cmd_read_idx) {
+        proto->cmd_queue[proto->cmd_write_idx] = *pcmd;
+        proto->cmd_write_idx = w;
+    }
+}
+
+void Protocol_Init(Protocol_t *proto, UART_HandleTypeDef *huart)
+{
+    proto->huart = huart;
+    proto->rx_write_idx = 0;
+    proto->rx_read_idx = 0;
+    proto->tx_busy = 0;
+    proto->cmd_write_idx = 0;
+    proto->cmd_read_idx = 0;
+    proto->text_rx_idx = 0;
+    memset(proto->rx_dma_buf, 0, PROTOCOL_RX_BUF_SIZE);
+    memset(proto->tx_buf, 0, PROTOCOL_TX_BUF_SIZE);
+    memset(proto->text_rx_buf, 0, sizeof(proto->text_rx_buf));
+
+    HAL_UART_Receive_DMA(huart, proto->rx_dma_buf, PROTOCOL_RX_BUF_SIZE);
+}
+
+void Protocol_Poll(Protocol_t *proto)
+{
+    /* Update write index from DMA counter (circular mode) */
+    proto->rx_write_idx = PROTOCOL_RX_BUF_SIZE - __HAL_DMA_GET_COUNTER(proto->huart->hdmarx);
+}
+
+void Protocol_ProcessRx(Protocol_t *proto)
+{
+    uint16_t write_idx = proto->rx_write_idx;
+    uint16_t read_idx = proto->rx_read_idx;
+    uint16_t processed = 0;
+
+#if !PROTOCOL_VOFA_ONLY
+    static uint8_t frame_buf[64];
+    static uint8_t frame_state = 0;
+    static uint8_t frame_len = 0;
+    static uint8_t frame_idx = 0;
+#endif
+
+    while (read_idx != write_idx && processed < PROTOCOL_RX_MAX_PROCESS_PER_CALL) {
+        uint8_t byte = proto->rx_dma_buf[read_idx];
+        read_idx = (read_idx + 1) % PROTOCOL_RX_BUF_SIZE;
+        processed++;
+
+#if PROTOCOL_VOFA_ONLY
+        /* ---- FireWater text line handling ---- */
+        if (byte == '\n' || byte == '\r') {
+            if (proto->text_rx_idx > 0) {
+                proto->text_rx_buf[proto->text_rx_idx] = '\0';
+                Protocol_ParseTextLine(proto, proto->text_rx_buf);
+                proto->text_rx_idx = 0;
+            }
+        } else if (proto->text_rx_idx < sizeof(proto->text_rx_buf) - 1) {
+            proto->text_rx_buf[proto->text_rx_idx++] = (char)byte;
+        }
+#else
+        /* ---- Binary frame state machine ---- */
+        switch (frame_state) {
+            case 0:
+                if (byte == FRAME_SOF0) frame_state = 1;
+                break;
+            case 1:
+                if (byte == FRAME_SOF1) frame_state = 2;
+                else if (byte == FRAME_SOF0) frame_state = 1;
+                else frame_state = 0;
+                break;
+            case 2:
+                frame_len = byte;
+                if (frame_len > 60) { frame_state = 0; break; }
+                frame_idx = 0;
+                frame_state = 3;
+                break;
+            case 3:
+                frame_buf[frame_idx++] = byte;
+                /* Need (CMD + DATA + CHK) = frame_len + 1 bytes */
+                if (frame_idx >= frame_len + 1) {
+                    uint8_t calc_chk = CalcChecksum(frame_buf, frame_len); /* CMD + DATA */
+                    if (calc_chk == frame_buf[frame_len]) {
+                        uint8_t cmd = frame_buf[0];
+                        ProtocolCmd_t pcmd;
+                        pcmd.cmd = cmd;
+
+                        switch (cmd) {
+                            case CMD_SET_TARGET:
+                                if (frame_len >= 19) {
+                                    pcmd.motor_id = frame_buf[1];
+                                    pcmd.data.target.mode = frame_buf[2];
+                                    memcpy(&pcmd.data.target.target_speed, &frame_buf[3], 4);
+                                    memcpy(&pcmd.data.target.target_angle, &frame_buf[7], 4);
+                                    memcpy(&pcmd.data.target.accel, &frame_buf[11], 4);
+                                    memcpy(&pcmd.data.target.decel, &frame_buf[15], 4);
+                                    Protocol_EnqueueCmd(proto, &pcmd);
+                                }
+                                break;
+
+                            case CMD_SET_PID:
+                                if (frame_len >= 15) {
+                                    pcmd.motor_id = frame_buf[1];
+                                    pcmd.data.pid.pid_type = frame_buf[2];
+                                    memcpy(&pcmd.data.pid.kp, &frame_buf[3], 4);
+                                    memcpy(&pcmd.data.pid.ki, &frame_buf[7], 4);
+                                    memcpy(&pcmd.data.pid.kd, &frame_buf[11], 4);
+                                    Protocol_EnqueueCmd(proto, &pcmd);
+                                }
+                                break;
+
+                            case CMD_SET_PID_BOTH:
+                                if (frame_len >= 13) {
+                                    pcmd.cmd = CMD_SET_PID_BOTH;
+                                    pcmd.motor_id = MOTOR_ID_BOTH;
+                                    pcmd.data.pid.pid_type = frame_buf[1];
+                                    memcpy(&pcmd.data.pid.kp, &frame_buf[2], 4);
+                                    memcpy(&pcmd.data.pid.ki, &frame_buf[6], 4);
+                                    memcpy(&pcmd.data.pid.kd, &frame_buf[10], 4);
+                                    Protocol_EnqueueCmd(proto, &pcmd);
+                                }
+                                break;
+
+                            case CMD_CONTROL:
+                                if (frame_len >= 3) {
+                                    pcmd.motor_id = frame_buf[1];
+                                    pcmd.data.control.ctrl_cmd = frame_buf[2];
+                                    Protocol_EnqueueCmd(proto, &pcmd);
+                                }
+                                break;
+
+                            case CMD_REQ_STATUS:
+                            case CMD_HEARTBEAT:
+                                pcmd.motor_id = (frame_len >= 2) ? frame_buf[1] : MOTOR_ID_BOTH;
+                                Protocol_EnqueueCmd(proto, &pcmd);
+                                break;
+
+                            case CMD_CALIBRATE:
+                                if (frame_len >= 2) {
+                                    pcmd.motor_id = frame_buf[1];
+                                    pcmd.data.control.ctrl_cmd = (frame_len >= 3) ? frame_buf[2] : 0;
+                                    /* 子命令：0=start, 1=stop */
+                                    Protocol_EnqueueCmd(proto, &pcmd);
+                                }
+                                break;
+
+                            case CMD_SET_VOFA:
+                                if (frame_len >= 3) {
+                                    pcmd.motor_id = frame_buf[1];
+                                    pcmd.data.vofa.interval_ms = frame_buf[2];
+                                    Protocol_EnqueueCmd(proto, &pcmd);
+                                }
+                                break;
+
+                            default:
+                                break;
+                        }
+                    }
+                    frame_state = 0;
+                }
+                break;
+        }
+#endif /* PROTOCOL_VOFA_ONLY */
+    }
+
+    proto->rx_read_idx = read_idx;
+}
+
+uint8_t Protocol_GetCommand(Protocol_t *proto, ProtocolCmd_t *cmd)
+{
+    if (proto->cmd_read_idx == proto->cmd_write_idx) return 0;
+    *cmd = proto->cmd_queue[proto->cmd_read_idx];
+    proto->cmd_read_idx = (proto->cmd_read_idx + 1) % PROTOCOL_CMD_QUEUE_SIZE;
+    return 1;
+}
+
+void Protocol_SendStatus(Protocol_t *proto, uint8_t motor_id, uint8_t mode_state,
+                         float actual_speed, float actual_angle,
+                         float target_speed, float target_angle,
+                         int16_t pwm_output, int32_t encoder_total, uint8_t fault)
+{
+#if PROTOCOL_VOFA_ONLY
+    (void)proto; (void)motor_id; (void)mode_state;
+    (void)actual_speed; (void)actual_angle; (void)target_speed; (void)target_angle;
+    (void)pwm_output; (void)encoder_total; (void)fault;
+    return;
+#else
+    if (proto->tx_busy) return;
+
+    uint8_t *p = proto->tx_buf;
+    uint8_t idx = 0;
+    p[idx++] = FRAME_SOF0;
+    p[idx++] = FRAME_SOF1;
+    uint8_t len_idx = idx++;        /* reserve LEN position */
+    p[idx++] = RSP_STATUS;          /* CMD */
+    p[idx++] = motor_id;
+    p[idx++] = mode_state;
+    memcpy(&p[idx], &actual_speed, 4); idx += 4;
+    memcpy(&p[idx], &actual_angle, 4); idx += 4;
+    memcpy(&p[idx], &target_speed, 4); idx += 4;
+    memcpy(&p[idx], &target_angle, 4); idx += 4;
+    memcpy(&p[idx], &pwm_output,   2); idx += 2;
+    memcpy(&p[idx], &encoder_total,4); idx += 4;
+    p[idx++] = fault;
+
+    uint8_t data_len = idx - len_idx - 1;  /* CMD + DATA length */
+    p[len_idx] = data_len;
+    p[idx++] = CalcChecksum(&p[len_idx + 1], data_len);  /* CHK over CMD+DATA */
+
+    proto->tx_busy = 1;
+    HAL_UART_Transmit_DMA(proto->huart, proto->tx_buf, idx);
+#endif
+}
+
+void Protocol_SendAck(Protocol_t *proto, uint8_t cmd, uint8_t result)
+{
+#if PROTOCOL_VOFA_ONLY
+    (void)proto; (void)cmd; (void)result;
+    return;
+#else
+    if (proto->tx_busy) return;
+
+    uint8_t *p = proto->tx_buf;
+    p[0] = FRAME_SOF0;
+    p[1] = FRAME_SOF1;
+    p[2] = 3;           /* LEN = CMD(1) + DATA(2) */
+    p[3] = RSP_ACK;     /* CMD */
+    p[4] = cmd;         /* DATA[0] */
+    p[5] = result;      /* DATA[1] */
+    p[6] = CalcChecksum(&p[3], 3);  /* CHK over CMD+DATA */
+
+    if (HAL_UART_Transmit_DMA(proto->huart, proto->tx_buf, 7) == HAL_OK) {
+        proto->tx_busy = 1;
+    }
+#endif
+}
+
+#if PROTOCOL_VOFA_ONLY
+void Protocol_SendVofaJustFloat(Protocol_t *proto, float *channels, uint8_t num_channels)
+{
+    static uint32_t call_cnt = 0;
+    static HAL_StatusTypeDef last_status = HAL_OK;
+    call_cnt++;
+
+    /* ---- 1 Hz register diagnostic (disabled) ------------------------ */
+#if 0
+    if ((call_cnt % 200) == 1) {
+        char dbg[160];
+        int n;
+        UART_HandleTypeDef *hu = proto->huart;
+        DMA_HandleTypeDef  *hd = (hu && hu->hdmatx) ? hu->hdmatx : NULL;
+
+        n = snprintf(dbg, sizeof(dbg),
+                     "[DIAG] txb=%d gS=%02lX hS=%02lX hL=%02lX last_ret=%d\r\n",
+                     (int)proto->tx_busy,
+                     (unsigned long)(hu ? hu->gState : 0xFF),
+                     (unsigned long)(hd ? hd->State : 0xFF),
+                     (unsigned long)(hd ? hd->Lock : 0xFF),
+                     (int)last_status);
+        HAL_UART_Transmit(hu, (uint8_t *)dbg, n, 50);
+
+        n = snprintf(dbg, sizeof(dbg),
+                     "[DIAG] CCR=%08lX CNDTR=%lu CR3=%08lX SR=%08lX\r\n",
+                     (unsigned long)(hd && hd->Instance ? hd->Instance->CCR : 0),
+                     (unsigned long)(hd && hd->Instance ? hd->Instance->CNDTR : 0),
+                     (unsigned long)(hu ? hu->Instance->CR3 : 0),
+                     (unsigned long)(hu ? hu->Instance->SR : 0));
+        HAL_UART_Transmit(hu, (uint8_t *)dbg, n, 50);
+    }
+#endif
+    /* ------------------------------------------------------------------ */
+
+    /* Poll DMA completion: if DMA channel is no longer enabled (EN=0),
+       the transfer has finished. This works around a missing DMA TC IRQ. */
+    if (proto->tx_busy && proto->huart->hdmatx && proto->huart->hdmatx->Instance) {
+        if ((proto->huart->hdmatx->Instance->CCR & DMA_CCR_EN) == 0) {
+            proto->tx_busy = 0;
+            proto->huart->gState = HAL_UART_STATE_READY;
+            proto->huart->ErrorCode = HAL_UART_ERROR_NONE;
+        }
+    }
+
+    if (proto->tx_busy) return;
+    if (num_channels == 0) return;
+
+    uint8_t *p = proto->tx_buf;
+    uint8_t idx = 0;
+
+    for (uint8_t i = 0; i < num_channels; i++) {
+        memcpy(&p[idx], &channels[i], 4);
+        idx += 4;
+    }
+
+    /* VOFA JustFloat frame tail */
+    p[idx++] = VOFA_TAIL_0;
+    p[idx++] = VOFA_TAIL_1;
+    p[idx++] = VOFA_TAIL_2;
+    p[idx++] = VOFA_TAIL_3;
+
+    /* Workaround: force DMA/UART state reset before every transmission
+       to bypass possible HAL state machine dead-lock. */
+    if (proto->huart->hdmatx != NULL) {
+        __HAL_DMA_DISABLE(proto->huart->hdmatx);
+        proto->huart->hdmatx->State = HAL_DMA_STATE_READY;
+        proto->huart->hdmatx->Lock = HAL_UNLOCKED;
+    }
+    if (proto->huart->gState != HAL_UART_STATE_READY) {
+        proto->huart->gState = HAL_UART_STATE_READY;
+        proto->huart->ErrorCode = HAL_UART_ERROR_NONE;
+    }
+
+    last_status = HAL_UART_Transmit_DMA(proto->huart, proto->tx_buf, idx);
+
+    if (last_status == HAL_OK) {
+        proto->tx_busy = 1;
+    }
+}
+#endif /* PROTOCOL_VOFA_ONLY */
+
+void Protocol_TxCompleteCallback(Protocol_t *proto)
+{
+    static uint32_t cplt_cnt = 0;
+    cplt_cnt++;
+#if 0
+    if ((cplt_cnt % 200) == 0) {
+        const char *msg = "[DIAG] TX Cplt OK\r\n";
+        HAL_UART_Transmit(proto->huart, (uint8_t *)msg, strlen(msg), 50);
+    }
+#endif
+    proto->tx_busy = 0;
+}

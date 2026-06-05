@@ -1,0 +1,690 @@
+# Dual_Closed-LOOP_Driver
+
+双路闭环电机驱动器，基于 **STM32F103C8T6**，支持速度/位置双模式闭环控制，集成 **VOFA 上位机** 实时波形显示与调参功能。
+
+> **当前为 VOFA-only 模式**：上电后自动以 200 Hz 输出 JustFloat 波形，调参通过 FireWater 文本命令完成。修改 `PROTOCOL_VOFA_ONLY` 为 `0` 可切换为纯二进制协议模式。
+>
+> **附带高可移植二进制协议驱动**：`Protocol/` 目录下提供独立的帧打包/解析器，四层解耦架构（常量定义 → 帧操作 → 状态机解析器 → HAL 适配层），零平台依赖，可直接移植到其他 MCU 或标准库项目。
+
+---
+
+## 目录
+
+- [硬件平台](#硬件平台)
+- [软件架构](#软件架构)
+- [通信协议](#通信协议)
+  - [FireWater 文本命令](#firewater-文本命令--详细语法解析)
+  - [二进制帧协议](#二进制帧协议)
+- [快速开始（VOFA 调参）](#快速开始vofa-调参)
+- [构建与烧录](#构建与烧录)
+- [切换为二进制协议模式](#切换为二进制协议模式)
+- [独立协议驱动 `Protocol/`](#独立协议驱动-protocol)
+- [项目结构](#项目结构)
+- [默认参数](#默认参数)
+
+---
+
+## 硬件平台
+
+| 参数 | 值 |
+|------|-----|
+| MCU | STM32F103C8T6 (ARM Cortex-M3, 72 MHz) |
+| Flash / RAM | 64 KB / 20 KB |
+
+### 电机与引脚分配
+
+| 电机 | 编码器 | PWM | 方向 GPIO |
+|------|--------|-----|-----------|
+| **电机 1** | TIM2 (PA0/PA1) | TIM4 CH1 (PB6) | PB7 (高电平=正转) |
+| **电机 2** | TIM1 (PA8/PA9) | TIM3 CH1 (PA6) | PA5 (高电平=正转) |
+
+### 其他外设
+
+| 外设 | 引脚 | 用途 |
+|------|------|------|
+| USART2 | PA2 (TX) / PA3 (RX) | 上位机通信（VOFA / 自定义上位机），TX=IT 模式，RX=DMA 环形缓冲 |
+| I2C1 | PB8 (SCL) / PB9 (SDA) | 预留（12864 OLED 等） |
+
+### 编码器参数
+
+- 编码器线数：**1024**
+- 解码模式：TI12 **四倍频**
+- 传动链：电机(16T) → 车轮(68T) → 编码器(30T)
+- 等效比：电机转 1 圈，编码器转 **16/30 圈**
+- **电机 1 圈 ≈ 2184.5 个 TIM 计数**
+
+```
+角度(rad) = encoder_total × 2π / 2184.533...
+速度(rad/s) = delta_count × 2π × 1000 / 2184.533...   (控制周期 1 ms)
+```
+
+---
+
+## 软件架构
+
+采用**模块化 + 非阻塞**设计，1 kHz 控制周期，所有模块均不阻塞：
+
+| 模块 | 文件 | 职责 |
+|------|------|------|
+| **Encoder** | `encoder.c/h` | 编码器读取、16 位溢出补偿、速度/角度计算 |
+| **Motor** | `motor.c/h` | PWM 输出（TIM3/TIM4）、方向控制、使能/急停 |
+| **PID** | `pid.c/h` | 位置式 PID，积分限幅 + 抗积分饱和 |
+| **Controller** | `controller.c/h` | 状态机、梯形轨迹规划、速度/位置串级闭环 |
+| **Protocol** | `protocol.c/h` | UART RX（DMA 环形缓冲）、文本/二进制命令解析 |
+| **VOFA** | `vofa.c/h` | JustFloat 波形帧发送（UART IT 非阻塞、双缓冲） |
+| **App** | `app.c/h` | 系统初始化、命令分发、1 kHz 控制调度 |
+
+### 控制时序
+
+- **SysTick 1 ms** → `App_ControlUpdate()`
+  - 编码器更新（×2）
+  - PID 计算 + 轨迹规划（×2）
+  - PWM 输出更新（×2）
+  - UART 命令轮询与解析
+  - 状态/波形发送
+
+### PWM 频率
+
+TIM3/TIM4 的 ARR 在启动时被动态修改为 **1799**，得到：
+
+```
+36 MHz / 1800 = 20 kHz
+```
+
+避免电机低频啸叫，同时保留 1800 级分辨率。
+
+---
+
+## 通信协议
+
+本项目支持**双协议切换**，通过 `protocol.h` 中的宏控制：
+
+| 模式 | 下发指令 | 上行数据 | 适用场景 |
+|------|----------|----------|----------|
+| **VOFA-only**（默认） | FireWater 文本命令 | JustFloat | 调参、波形观察 |
+| **Binary-only** | 二进制帧协议（`0xAA 0x55`） | STATUS / ACK 帧 | 自定义上位机、高可靠通信 |
+
+### VOFA-only 模式（当前默认）
+
+上电即自动以 **200 Hz** 发送 JustFloat 帧。VOFA 发送采用 **UART IT 中断模式**（双缓冲），相比 HAL DMA 更稳定，持续输出不丢帧。
+
+#### JustFloat 通道定义
+
+| 通道 | 数据 | 单位 |
+|------|------|------|
+| ch0 | 电机1 实际速度 | rad/s |
+| ch1 | 电机1 实际角度 | rad |
+| ch2 | 电机1 PWM | — |
+| ch3 | 电机1 轨迹目标速度 | rad/s |
+| ch4 | 电机1 轨迹目标角度 | rad |
+| ch5 | 电机2 实际速度 | rad/s |
+| ch6 | 电机2 实际角度 | rad |
+| ch7 | 电机2 PWM | — |
+| ch8 | 电机2 轨迹目标速度 | rad/s |
+| ch9 | 电机2 轨迹目标角度 | rad |
+
+帧尾：`0x00 0x00 0x80 0x7f`
+
+#### FireWater 文本命令 — 详细语法解析
+
+所有命令均为 **ASCII 文本行**，以换行符 `\n` 结束。参数之间以**空格或制表符**分隔，命令字符（`M`/`P`/`C`/`V`/`S`）必须**大写**。
+
+##### 通用语法规则
+
+```
+<CMD> <arg1> <arg2> ... <argN>\n
+```
+
+- 多余空格会被自动忽略
+- 缺少参数或格式错误时，命令被静默丢弃（无错误回显）
+- 浮点数支持 `5.0`、`10` 格式，**不支持**科学计数法或无前导零小数（如 `.5`）
+
+---
+
+##### 1. `M` — 设置目标参数（Mode / Target）
+
+**语法**：
+```
+M <motor> <mode> <speed> <angle> <accel> <decel>
+```
+
+**参数**：
+
+| 参数 | 类型 | 范围 | 说明 |
+|------|------|------|------|
+| `motor` | 整数 | `0` 或 `1` | `0`=电机1, `1`=电机2 |
+| `mode` | 整数 | `0` 或 `1` | `0`=速度模式, `1`=位置模式 |
+| `speed` | 浮点 | rad/s | 目标速度（速度模式下的巡航速度；位置模式下的速度上限） |
+| `angle` | 浮点 | rad | 目标角度（仅位置模式有效，速度模式下可填 `0`） |
+| `accel` | 浮点 | rad/s², >0 | 加速度限制。`0` 或负数会被忽略，保持原值 |
+| `decel` | 浮点 | rad/s², >0 | 减速度限制。`0` 或负数会被忽略，保持原值 |
+
+**行为**：
+- 新目标直接以当前 `traj_speed` 为起点平滑过渡，**不强制刹车、不重置 PID**
+- 高频连续发送时，命令队列自动保留同电机的最新目标，避免中间指令造成抖动
+- `traj_speed` 以 `accel` 为斜率向 `speed` 线性 ramp
+
+**示例**：
+```
+M 0 0 5.0 0.0 10.0 10.0    (电机1, 速度模式, 目标5 rad/s, 加减速10)
+M 0 1 2.0 3.14 5.0 5.0     (电机1, 位置模式, 限速2 rad/s, 目标π rad)
+```
+
+---
+
+##### 2. `P` / `PB` — 设置 PID 参数
+
+**语法**：
+```
+P <motor> <pid_type> <kp> <ki> <kd>
+PB <pid_type> <kp> <ki> <kd>
+```
+
+**参数**：
+
+| 参数 | 类型 | 范围 | 说明 |
+|------|------|------|------|
+| `motor` | 整数/字符 | `0`、`1` 或 `B` | 目标电机：`0`=电机1, `1`=电机2, `B`=双电机同时 |
+| `pid_type` | 整数 | `0` 或 `1` | `0`=速度环 PID, `1`=位置环 PID |
+| `kp` | 浮点 | — | 比例增益 |
+| `ki` | 浮点 | — | 积分增益 |
+| `kd` | 浮点 | — | 微分增益 |
+
+**限制**：
+- 速度环输出限制：`±1000`
+- 速度环积分限制：`±300`
+- 位置环输出限制：`±100`（作为速度修正量）
+- 位置环积分限制：`±50`
+
+**示例**：
+```
+P 0 0 3.0 0.8 0.0          (电机1速度环: Kp=3, Ki=0.8, Kd=0)
+P 0 1 5.0 0.0 0.1          (电机1位置环: Kp=5, Ki=0, Kd=0.1)
+PB 0 3.0 0.8 0.0           (双电机同时设置速度环 PID)
+```
+
+---
+
+##### 3. `C` — 控制指令（Control）
+
+**语法**：
+```
+C <motor> <cmd>
+```
+
+**参数**：
+
+| 参数 | 类型 | 范围 | 说明 |
+|------|------|------|------|
+| `motor` | 整数 | `0`, `1`, `255` | `0`=电机1, `1`=电机2, `255`=双电机同时 |
+| `cmd` | 整数 | `0`~`4` | 见下表 |
+
+**指令码**：
+
+| `cmd` | 名称 | 效果 |
+|-------|------|------|
+| `0` | **ENABLE** | 使能电机，状态机 → `RUNNING`，PWM 开始输出 |
+| `1` | **DISABLE** | 失能电机，状态机 → `IDLE`，PWM = 0 |
+| `2` | **HOME** | 编码器清零，轨迹归零，PID 重置，PWM = 0 |
+| `3` | **EMERGENCY** | 急停，状态机 → `EMERGENCY`，PWM 强制为 0 |
+| `4` | **CLEAR_FAULT** | 清除急停/故障，状态机 → `IDLE`（需再发 `C x 0` 使能） |
+
+**状态机转换**：
+
+```
+[IDLE] --C x 0--> [RUNNING] --C x 3--> [EMERGENCY]
+   ^                  |    ^
+   |--C x 4-----------|    |--C x 1--> [IDLE]
+   |--C x 1---------------|
+```
+
+**示例**：
+```
+C 0 0                      (使能电机1)
+C 0 3                      (电机1急停)
+C 0 4                      (清除故障)
+C 0 0                      (重新使能)
+C 255 0                    (同时使能双电机)
+```
+
+---
+
+##### 4. `B` — 动态制动（Brake）
+
+**语法**：
+```
+B <motor> <brake_pwm>
+```
+
+**参数**：
+
+| 参数 | 类型 | 范围 | 说明 |
+|------|------|------|------|
+| `motor` | 整数 | `0`, `1`, `255` | `0`=电机1, `1`=电机2, `255`=双电机同时 |
+| `brake_pwm` | 整数 | `0` ~ `1000` | 制动强度（占空比百分比 × 10）。`0`=解除制动 |
+
+**原理**：
+- **动态制动（能耗制动）**：根据当前实际转速方向，反向施加 PWM 电压，电机变为发电机，动能通过驱动电阻耗散
+- **过零自锁**：每个控制周期（1 ms）检测速度，当速度降到 `SPEED_DEADBAND`（0.1 rad/s）以内时，**自动切断 PWM**，电机停止，不会反向加速
+- 与急停（`C x 3`）不同：急停只是切断 PWM 让电机自由滑行，制动是主动施加反向转矩，制动效果更强
+
+**安全机制**：
+- 电机已停止时发送制动指令 → 不输出任何 PWM
+- 速度过零后自动解除制动 → 不会反向飞车
+- `DISABLE` / `EMERGENCY` / `HOME` 时自动清除制动状态
+- **新 `M` / `P` 指令可打断制动**：制动期间发送目标或 PID 指令，自动清除 `braking` 标志，恢复 PID 控制
+
+**示例**：
+```
+B 0 800                    (电机1以80% PWM强度制动)
+B 1 1000                   (电机2全力制动)
+B 255 600                  (双电机同时以60%强度制动)
+B 0 0                      (解除电机1制动)
+```
+
+**制动打断示例**：
+```
+# 电机正转中执行制动
+M 0 0 5.0 0.0 10.0 10.0
+B 0 800
+
+# 制动过程中发送新目标，立即打断制动、恢复 PID 控制
+M 0 0 -3.0 0.0 10.0 10.0
+```
+
+---
+
+##### 5. `V` — 设置 JustFloat 输出频率
+
+**语法**：
+```
+V <interval_ms>
+```
+
+**参数**：
+
+| 参数 | 类型 | 范围 | 说明 |
+|------|------|------|------|
+| `interval_ms` | 整数 | `0` 或 `≥1` | 帧间隔毫秒数。`0`=关闭输出，`5`=200Hz，`10`=100Hz |
+
+**示例**：
+```
+V 5                        (200 Hz)
+V 10                       (100 Hz)
+V 0                        (关闭波形输出)
+```
+
+---
+
+##### 6. `S` — 请求状态（Status）
+
+**语法**：
+```
+S <motor>
+```
+
+> **注意**：仅在 `PROTOCOL_VOFA_ONLY = 0`（二进制协议模式）时有效。VOFA-only 模式下无此命令。
+
+---
+
+##### 完整调参流程示例
+
+```
+# 1. 使能电机
+C 0 0
+
+# 2. 设定速度模式目标（速度5 rad/s，加减速10）
+M 0 0 5.0 0.0 10.0 10.0
+
+# 3. 观察 ch0（实际速度）与 ch3（目标速度）的跟随情况
+#    若响应过慢/超调，调整 PID：
+P 0 0 3.0 0.8 0.0
+
+# 4. 切换到位置模式（目标π rad，限速2，加减速5）
+M 0 1 2.0 3.14 5.0 5.0
+
+# 5. 动态制动（瞬间抑制惯性，速度过零自动停止）
+B 0 800
+
+# 6. 急停（任何情况下立即切断 PWM）
+C 0 3
+
+# 7. 清除故障并重新使能
+C 0 4
+C 0 0
+```
+
+---
+
+##### 无编码器开环测试说明
+
+若**未接编码器**，`actual_speed` 始终为 0，PID 速度环会将误差（`traj_speed - 0`）持续积分，最终 PWM 会饱和到最大值（约 1000）。此时：
+- **ch0 始终为 0** 是正常的
+- **ch2 会从 0 爬升到 1000**（约 1~2 秒饱和）
+- 接上编码器后，ch2 会立即下降到与负载匹配的稳态值
+
+> 完整二进制协议定义见 [`COMM_PROTOCOL.md`](COMM_PROTOCOL.md)。
+
+---
+
+### 指令优先级与制动状态机
+
+#### 指令优先级（高 → 低）
+
+| 优先级 | 指令 | 效果 |
+|--------|------|------|
+| 1 | `C x 3` (EMERGENCY) | 状态机 → `EMERGENCY`，PWM 强制为 0，清除 `braking` |
+| 2 | `C x 1` (DISABLE) | 状态机 → `IDLE`，PWM = 0，清除 `braking` |
+| 3 | `B x xxx` (BRAKE) | `braking = 1`，强制反向 PWM，绕过 PID |
+| 4 | `M ...` (SET_TARGET) | 清除 `braking`，恢复 PID，执行新目标 |
+| 5 | `P ...` (SET_PID) | 清除 `braking`，更新 PID 参数 |
+| 6 | `C x 2` (HOME) | 清除 `braking`，编码器清零 |
+| 7 | `C x 4` (CLEAR_FAULT) | 清除 `braking`，状态机 → `IDLE` |
+| 8 | `C x 0` (ENABLE) | 状态机 → `RUNNING`（不影响 `braking`） |
+
+> **说明**：`B` 指令优先级高于 `M`/`P`，但低于 `C x 3`/`C x 1`。制动期间发送 `M` 或 `P` 会自动打断制动、恢复 PID 控制。
+
+#### 制动结束标志位 (`braking`) 清除路径
+
+`braking` 标志由 `Controller_Update()` 的 `braking` 分支控制，**以下场景均会将其清零**：
+
+| 场景 | 触发条件 | 清除位置 |
+|------|---------|---------|
+| **速度过零自动解除** | `actual_speed` 降到 `SPEED_DEADBAND` (0.1 rad/s) 以内 | `Controller_Update()` |
+| **新目标指令打断** | 制动期间收到 `M` 指令 | `App_ProcessCommand()` |
+| **新 PID 指令打断** | 制动期间收到 `P` 指令 | `App_ProcessCommand()` |
+| **手动解除制动** | 发送 `B x 0` | `Controller_Brake()` |
+| **DISABLE** | 发送 `C x 1` | `Controller_Disable()` |
+| **EMERGENCY** | 发送 `C x 3` | `Controller_EmergencyStop()` |
+| **HOME** | 发送 `C x 2` | `Controller_Home()` |
+| **CLEAR_FAULT** | 发送 `C x 4` | `Controller_ClearEmergency()` |
+
+#### 制动状态机
+
+```
+[RUNNING] --B x xxx--> [BRAKING] --速度过零--> [RUNNING] (braking=0, PID恢复)
+    ^                                              ^
+    |--C x 3--> [EMERGENCY] --C x 4--> [IDLE] --C x 0--|
+    |--C x 1--> [IDLE] --C x 0-------------------------|
+    |--M / P----> [RUNNING] (打断制动)-----------------|
+```
+
+> **关键设计**：`braking = 1` 时，`Controller_Update()` 的 1 kHz 循环中**直接输出反向 PWM**（绕过 PID），但 `Protocol_ProcessRx()` 和 `App_ProcessCommand()` 不受影响，新指令正常入队/出队并被处理。
+
+---
+
+### 二进制帧协议
+
+当 `PROTOCOL_VOFA_ONLY = 0` 时，下位机仅使用二进制帧协议进行通信，FireWater 文本命令与 JustFloat 均被禁用。
+
+**帧格式**：
+
+```
+[0xAA][0x55][LEN][CMD][DATA...][CHK]
+```
+
+- **LEN** = CMD + DATA 的字节数
+- **CHK** = CMD + DATA 所有字节的累加和（低 8 位）
+- 小端模式，float 为 IEEE 754 单精度
+
+**下行命令码**（上位机 → 下位机）：
+
+| 命令码 | 名称 | LEN | 功能 |
+|--------|------|-----|------|
+| `0x01` | SET_TARGET | 19 | 设置目标参数（模式/速度/角度/加减速） |
+| `0x02` | SET_PID | 15 | 设置单个电机的 PID 参数 |
+| `0x07` | SET_PID_BOTH | 14 | 同时设置两个电机的 PID 参数（共用同一组参数） |
+| `0x03` | CONTROL | 3 | 控制指令（使能/失能/急停/回零/清除故障） |
+| `0x04` | REQ_STATUS | 1~2 | 请求状态帧 |
+| `0x05` | HEARTBEAT | 1~2 | 心跳包 |
+| `0x06` | SET_VOFA | 3 | 设置 JustFloat 输出频率（仅在 VOFA-only 模式下有效） |
+
+**上行响应码**（下位机 → 上位机）：
+
+| 响应码 | 名称 | LEN | 功能 |
+|--------|------|-----|------|
+| `0x81` | STATUS | 25 | 周期性状态上报（速度/角度/PWM/编码器等） |
+| `0x82` | ACK | 3 | 通用应答（心跳回应等） |
+
+完整帧结构、字段偏移表、校验和算法、状态机说明及通信时序示例见 [`COMM_PROTOCOL.md`](COMM_PROTOCOL.md)。
+
+---
+
+## 快速开始（VOFA 调参）
+
+### 1. 硬件连接
+
+- USB 转 TTL 连接 **PA2(TX)** 和 **PA3(RX)**，波特率 **115200**。
+- 电机驱动器接 **PB6/PB7**（电机1）和 **PA6/PA5**（电机2）。
+- 编码器接 **PA0/PA1**（电机1）和 **PA8/PA9**（电机2）。
+
+### 2. VOFA 配置
+
+1. 打开 **VOFA+**，选择串口，波特率 **115200-8-N1**。
+2. 新建 **JustFloat** 控件，添加 **10 个通道**，按上表绑定。
+3. 打开「命令」窗口，准备输入文本指令。
+
+### 3. 上电调试流程
+
+```
+C 0 0                        (使能电机1)
+M 0 0 5.0 0.0 10.0 10.0      (速度模式, 目标5 rad/s, 加减速10)
+```
+
+观察 ch0（实际速度）与 ch3（目标速度）的跟随情况。
+
+**调 PID**：
+```
+P 0 0 3.0 0.8 0.0            (调速度环 Kp=3 Ki=0.8)
+```
+
+**位置模式**：
+```
+M 0 1 2.0 3.14 5.0 5.0       (位置模式, 目标π rad, 限速2, 加减速5)
+```
+
+**动态制动**（瞬间抑制惯性，速度过零自动停止）：
+```
+B 0 800
+```
+
+**急停**：
+```
+C 0 3
+```
+
+**清除故障并重新使能**：
+```
+C 0 4
+C 0 0
+```
+
+---
+
+## 构建与烧录
+
+### 环境要求
+
+- **VS Code + STM32Cube 扩展**（推荐）：自动使用 STM32Cube bundles 中的工具链
+- 或手动安装：GNU ARM Embedded Toolchain (`arm-none-eabi-gcc`)、CMake ≥ 3.22、Ninja
+
+> **注意**：工具链路径已做自动适配。`cmake/gcc-arm-none-eabi.cmake` 会从 `gcc` 的完整路径自动推断 `objcopy` 和 `size` 的位置，解决 VS Code 中 `arm-none-eabi-objcopy 不是内部或外部命令` 的构建错误。
+
+### 编译
+
+```bash
+cmake --preset Debug
+cmake --build --preset Debug
+```
+
+若使用 VS Code，修改 `cmake/gcc-arm-none-eabi.cmake` 等 toolchain 文件后，需先 **删除缓存并重新配置**（`CMake: Delete Cache and Reconfigure`），再点击 Build。
+
+### 烧录
+
+**ST-Link GDB**（VS Code 直接调试）：
+使用项目自带的 `.vscode/launch.json`。
+
+**OpenOCD**：
+```bash
+openocd -f interface/stlink.cfg -f target/stm32f1x.cfg -c "program build/Debug/Dual_Closed-LOOP_Driver.elf verify reset exit"
+```
+
+---
+
+## 切换为二进制协议模式
+
+如需对接自定义上位机，切换为纯二进制帧协议：
+
+1. 打开 `Core/Inc/protocol.h`
+2. 修改第 32 行：
+   ```c
+   #define PROTOCOL_VOFA_ONLY      0   /* 将 1 改为 0 */
+   ```
+3. 重新编译烧录
+
+切换后：
+- 仅收发二进制帧（`0xAA 0x55` 帧头，带校验和）
+- 自动周期性发送 STATUS 帧（`0x81`），默认 100 Hz
+- 心跳应答（`0x85`）
+- FireWater 文本命令与 JustFloat 均被禁用
+
+> 二进制协议完整定义见 [`COMM_PROTOCOL.md`](COMM_PROTOCOL.md)。
+
+---
+
+## 独立协议驱动 `Protocol/`
+
+项目根目录下 `Protocol/` 是一个**独立、高可移植**的二进制通信协议驱动，与 `Core/` 下的业务代码解耦，可随时复制到其他项目中单独使用。
+
+### 文件说明
+
+| 文件 | 职责 | 平台依赖 |
+|------|------|----------|
+| `bp_def.h` | 命令码、响应码、状态机常量定义 | ❌ 无 |
+| `bp_frame.h/.c` | 帧打包/解包（结构体 ↔ 字节流），含校验和计算 | ❌ 无 |
+| `bp_parser.h/.c` | 通用字节流解析器（状态机），支持单字节/批量喂入 | ❌ 无 |
+| `bp_hal_uart.h/.c` | HAL UART 适配层（DMA Circular 接收 + 阻塞发送） | ✅ 仅此处引用 `stm32f1xx_hal.h` |
+| `example/main_example.c` | 完整集成示例（中断回调、命令分发、周期发送 STATUS） | — |
+
+### 架构特点
+
+- **四层解耦**：常量定义 → 帧操作 → 状态机解析器 → HAL 适配层，每层可独立替换
+- **零平台依赖**：`bp_def` / `bp_frame` / `bp_parser` 不引用任何 HAL/平台头文件，仅使用标准 C 库
+- **小端显式处理**：多字节数据用位移操作拼装，不依赖编译器 struct packing
+- **浮点安全**：`memcpy` 直接拷贝 IEEE-754 字节，不做任何数值转换
+- **DMA Circular 双缓冲**：HT + TC 双中断保证低延迟，CPU 零拷贝接收
+
+### 使用方式
+
+**方式一：继续使用 HAL（推荐）**
+
+```c
+#include "bp_hal_uart.h"
+
+bp_hal_uart_t g_bp_uart;
+
+/* 初始化 */
+bp_hal_uart_init(&g_bp_uart, &huart2, my_frame_callback);
+
+/* HAL 回调转发 */
+void HAL_UART_RxHalfCpltCallback(UART_HandleTypeDef *huart) {
+    if (huart == g_bp_uart.huart) bp_hal_uart_rx_half_callback(&g_bp_uart);
+}
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+    if (huart == g_bp_uart.huart) bp_hal_uart_rx_cplt_callback(&g_bp_uart);
+}
+```
+
+**方式二：不使用 HAL（标准库 / LL / 其他 MCU）**
+
+只复制 `bp_def.h` + `bp_frame.h/.c` + `bp_parser.h/.c`，自己实现 UART 层：
+
+```c
+#include "bp_parser.h"
+
+bp_parser_t parser;
+bp_parser_init(&parser, my_callback);
+
+/* 每收到一个字节 */
+bp_parser_feed(&parser, rx_byte);
+
+/* 组帧发送 */
+bp_builder_t b;
+bp_cmd_control_t cmd = { .motor_id = 0, .ctrl_cmd = BP_CTRL_ENABLE };
+uint8_t *frame;
+uint8_t len = bp_build_cmd_control(&b, &cmd, &frame);
+uart_send(frame, len);
+```
+
+### 扩展新命令
+
+如需添加新的命令码或字段：
+1. 在 `bp_def.h` 中定义新的 `CMD_XXX` 宏
+2. 在 `bp_frame.h` 中新增结构体（如 `bp_cmd_xxx_t`）
+3. 在 `bp_frame.c` 中实现对应的 `bp_build_cmd_xxx()` 和 `bp_parse_cmd_xxx()` 函数
+4. 解析器状态机 `bp_parser.c` **无需任何修改**
+
+---
+
+## 项目结构
+
+```
+.
+├── Core/
+│   ├── Inc/                    # 头文件
+│   │   ├── app.h
+│   │   ├── controller.h
+│   │   ├── encoder.h
+│   │   ├── motor.h
+│   │   ├── pid.h
+│   │   ├── protocol.h          # 协议切换宏 PROTOCOL_VOFA_ONLY 在此
+│   │   ├── vofa.h              # JustFloat 帧格式与 VOFA 句柄
+│   │   └── main.h
+│   └── Src/                    # 源文件
+│       ├── app.c               # 主调度、命令分发
+│       ├── controller.c        # 轨迹规划 + 串级 PID
+│       ├── encoder.c           # 编码器读取 + 溢出处理
+│       ├── motor.c             # PWM + 方向控制
+│       ├── pid.c               # PID 算法
+│       ├── protocol.c          # UART RX (DMA) + 命令解析
+│       ├── vofa.c              # JustFloat 波形发送 (UART IT)
+│       └── main.c              # HAL 初始化入口
+├── Protocol/                   # 独立二进制协议驱动（可移植到其他项目）
+│   ├── bp_def.h                # 协议常量定义
+│   ├── bp_frame.h/.c           # 帧打包/解包
+│   ├── bp_parser.h/.c          # 通用字节流解析器（状态机）
+│   ├── bp_hal_uart.h/.c        # HAL UART 适配层
+│   └── example/
+│       └── main_example.c      # 驱动集成示例
+├── Drivers/                    # STM32 HAL / CMSIS
+├── cmake/
+├── CMakeLists.txt
+├── COMM_PROTOCOL.md            # 通信协议详细文档
+└── README.md                   # 本文件
+```
+
+---
+
+## 默认参数
+
+| 参数 | 值 |
+|------|-----|
+| 控制周期 | 1 ms (1 kHz) |
+| PWM 频率 | 20 kHz |
+| VOFA JustFloat | 200 Hz（上电即输出） |
+| 速度环 PID | Kp=10.0, Ki=1.0, Kd=2.0 |
+| 位置环 PID | Kp=25.0, Ki=0.0, Kd=1.0 |
+| 默认加速度 | 10 rad/s² |
+| 默认减速度 | 10 rad/s² |
+| PWM 输出范围 | ±1000（对应 55% 占空比，约 11 V / 20 V） |
+
+---
+
+## 注意事项
+
+1. **USER CODE 保护**：`main.c`、`stm32f1xx_it.c`、`stm32f1xx_hal_msp.c` 中所有自定义代码均置于 `USER CODE BEGIN/END` 块内，重新生成 CubeMX 代码时不会被覆盖。
+2. **不要修改 HAL 源码**：`Drivers/STM32F1xx_HAL_Driver/` 为生成代码，如需修改配置请调整 `.ioc` 文件后重新生成。
+3. **编码器溢出**：控制周期 1 ms 内电机不可能溢出 16 位计数器（理论极限约 4000 转/秒），溢出处理仅作为极端工况保险。
+4. **高频指令不刹车**：连续发送 `M` 命令时，轨迹规划器以当前状态为起点直接 ramp 到新目标，电机不会刹停后再加速。
+5. **命令队列去重**：同一电机在队列中堆积多条 `M` 指令时，只执行最新的一条，避免滞后和抖动。
+6. **协议模式互斥**：`PROTOCOL_VOFA_ONLY = 1` 时仅支持 VOFA JustFloat + FireWater 文本命令；`PROTOCOL_VOFA_ONLY = 0` 时仅支持二进制帧收发。两种模式不共存。
