@@ -53,12 +53,12 @@ class ProtocolPacket {
 
   @override
   String toString() {
-    return 'Packet(cmd: 0x\${command.toRadixString(16).padLeft(2, '0')}, '
-        'len: \${payload.length}, payload: \${_bytesToHex(payload)})';
+    return "Packet(cmd: 0x${command.toRadixString(16).padLeft(2, '0')}, "
+        "len: ${payload.length}, payload: ${_bytesToHex(payload)}";
   }
 
   static String _bytesToHex(Uint8List bytes) {
-    return bytes.map((b) => '0x\${b.toRadixString(16).padLeft(2, '0')}').join(' ');
+    return bytes.map((b) => "0x${b.toRadixString(16).padLeft(2, '0')}").join(' ');
   }
 }
 

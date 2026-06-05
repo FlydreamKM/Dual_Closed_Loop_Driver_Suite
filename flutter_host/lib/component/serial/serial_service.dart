@@ -15,6 +15,7 @@ abstract class ISerialService {
   Future<bool> sendPacket(ProtocolPacket packet);
   bool get isConnected;
   List<String> get availablePorts;
+  void dispose();
 }
 
 enum SerialConnectionState { disconnected, connecting, connected, error }

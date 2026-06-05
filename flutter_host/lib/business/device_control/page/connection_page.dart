@@ -85,7 +85,7 @@ class _ConnectionPageState extends ConsumerState<ConnectionPage> {
                     : (_selectedPort != null || _useMock)
                         ? () => _connect()
                         : null,
-                icon: Icon(isConnected ? Icons.disconnect : Icons.usb),
+                icon: Icon(isConnected ? Icons.usb : Icons.usb_off),
                 label: Text(isConnected ? 'Disconnect' : 'Connect'),
                 style: ElevatedButton.styleFrom(
                   backgroundColor: isConnected ? Colors.red : Colors.green,
