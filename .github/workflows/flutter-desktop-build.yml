@@ -85,6 +85,8 @@ jobs:
   release:
     needs: [build-linux, build-windows]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.release == 'true'
     steps:
       - name: Download Linux artifact
