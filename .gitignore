@@ -1,0 +1,30 @@
+# .gitignore
+
+# Build output
+build/
+cmake-build-*/
+*.o
+*.d
+*.elf
+*.hex
+*.bin
+*.map
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.cproject
+.project
+.mxproject
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# CubeMX
+.settings/
+.mxproject
