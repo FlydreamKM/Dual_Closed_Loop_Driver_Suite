@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:smt_host_app/component/serial/serial_service.dart';
 import 'package:smt_host_app/business/device_control/view_model/device_viewmodels.dart';
 
 class PidConfigPage extends ConsumerWidget {

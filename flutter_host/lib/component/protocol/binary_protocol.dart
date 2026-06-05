@@ -128,12 +128,30 @@ class CommandCodes {
   static const int CMD_CONTROL = 0x03;         // Control: enable/disable/stop/home/clear_fault
   static const int CMD_REQ_STATUS = 0x04;      // Request status frame
   static const int CMD_HEARTBEAT = 0x05;       // Heartbeat keepalive
+  static const int CMD_HANDSHAKE = 0x06;       // Handshake / ping
   static const int CMD_SET_PID_BOTH = 0x07;    // Set both motors PID
-  static const int CMD_CALIBRATE = 0x08;         // Calibration mode
+  static const int CMD_CALIBRATE = 0x08;       // Calibration mode
+
+  // Motor movement commands
+  static const int CMD_MOTOR_MOVE = 0x11;      // Move motor to position
+  static const int CMD_MOTOR_STOP = 0x12;      // Stop motor motion
+  static const int CMD_MOTOR_HOME = 0x13;      // Home / zero position
+
+  // Configuration commands
+  static const int CMD_GET_PID = 0x24;         // Read current PID values
+  static const int CMD_ENTER_CALIB = 0x25;     // Enter calibration mode
+  static const int CMD_EXIT_CALIB = 0x26;      // Exit calibration mode
+  static const int CMD_START_STREAM = 0x27;    // Start data streaming
+  static const int CMD_STOP_STREAM = 0x28;     // Stop data streaming
+  static const int CMD_GET_STATUS = 0x29;      // Get device status
+  static const int CMD_RESET = 0x2A;           // Reset device
 
   // Upstream (Driver → Host)
   static const int CMD_STATUS = 0x81;          // Periodic status report (100Hz, 25 bytes)
   static const int CMD_ACK = 0x82;             // General acknowledgement
+  static const int CMD_NACK = 0x83;            // Negative acknowledgement
+  static const int CMD_ERROR = 0x84;           // Error report
+  static const int CMD_STREAM_DATA = 0x85;     // Stream data frame
 }
 
 /// Control sub-commands (for CMD_CONTROL payload)
