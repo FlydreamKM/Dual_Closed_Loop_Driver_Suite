@@ -28,7 +28,7 @@ class _DataVisualizationPageState extends ConsumerState<DataVisualizationPage> {
   @override
   Widget build(BuildContext context) {
     final dataSamples = ref.watch(dataStreamProvider);
-    final isConnected = ref.watch(connectionStateProvider) == ConnectionState.connected;
+    final isConnected = ref.watch(connectionStateProvider) == SerialConnectionState.connected;
 
     // Filter samples by selected channel
     final channelSamples = dataSamples.where((s) => s.label == _selectedChannel).toList();

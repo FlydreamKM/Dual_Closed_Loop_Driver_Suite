@@ -12,15 +12,15 @@ final deviceRepositoryProvider = Provider<DeviceRepository>((ref) {
 });
 
 // Connection state provider
-final connectionStateProvider = StateNotifierProvider<ConnectionNotifier, ConnectionState>((ref) {
+final connectionStateProvider = StateNotifierProvider<ConnectionNotifier, SerialConnectionState>((ref) {
   final repo = ref.watch(deviceRepositoryProvider);
   return ConnectionNotifier(repo);
 });
 
-class ConnectionNotifier extends StateNotifier<ConnectionState> {
+class ConnectionNotifier extends StateNotifier<SerialConnectionState> {
   final DeviceRepository _repo;
   
-  ConnectionNotifier(this._repo) : super(ConnectionState.disconnected) {
+  ConnectionNotifier(this._repo) : super(SerialConnectionState.disconnected) {
     _repo.connectionStream.listen((newState) {
       state = newState;
     });

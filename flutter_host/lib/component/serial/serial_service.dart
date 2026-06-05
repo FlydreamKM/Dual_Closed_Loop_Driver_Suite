@@ -8,7 +8,7 @@ import 'package:logger/logger.dart';
 /// Implementations: [SerialPortService] (real hardware), [MockSerialService] (simulation)
 abstract class ISerialService {
   Stream<ProtocolPacket> get packetStream;
-  Stream<ConnectionState> get connectionStateStream;
+  Stream<SerialConnectionState> get connectionStateStream;
 
   Future<bool> connect(String portName, {int baudRate = 115200});
   Future<void> disconnect();
@@ -17,7 +17,7 @@ abstract class ISerialService {
   List<String> get availablePorts;
 }
 
-enum ConnectionState { disconnected, connecting, connected, error }
+enum SerialConnectionState { disconnected, connecting, connected, error }
 
 /// Real serial port service using flutter_libserialport
 class SerialPortService implements ISerialService {
@@ -27,19 +27,19 @@ class SerialPortService implements ISerialService {
   StreamSubscription<Uint8List>? _subscription;
 
   final _packetController = StreamController<ProtocolPacket>.broadcast();
-  final _stateController = StreamController<ConnectionState>.broadcast();
+  final _stateController = StreamController<SerialConnectionState>.broadcast();
   final _parser = ProtocolParser();
 
-  ConnectionState _state = ConnectionState.disconnected;
+  SerialConnectionState _state = SerialConnectionState.disconnected;
 
   @override
   Stream<ProtocolPacket> get packetStream => _packetController.stream;
 
   @override
-  Stream<ConnectionState> get connectionStateStream => _stateController.stream;
+  Stream<SerialConnectionState> get connectionStateStream => _stateController.stream;
 
   @override
-  bool get isConnected => _state == ConnectionState.connected && _port != null;
+  bool get isConnected => _state == SerialConnectionState.connected && _port != null;
 
   @override
   List<String> get availablePorts => SerialPort.availablePorts;
@@ -47,14 +47,14 @@ class SerialPortService implements ISerialService {
   @override
   Future<bool> connect(String portName, {int baudRate = 115200}) async {
     try {
-      _setState(ConnectionState.connecting);
+      _setState(SerialConnectionState.connecting);
       _parser.clear();
 
       _port = SerialPort(portName);
 
       if (!_port!.openReadWrite()) {
         _logger.e('Failed to open port: $portName');
-        _setState(ConnectionState.error);
+        _setState(SerialConnectionState.error);
         return false;
       }
 
@@ -71,17 +71,17 @@ class SerialPortService implements ISerialService {
         _onData,
         onError: (error) {
           _logger.e('Serial read error: $error');
-          _setState(ConnectionState.error);
+          _setState(SerialConnectionState.error);
         },
       );
 
-      _setState(ConnectionState.connected);
+      _setState(SerialConnectionState.connected);
       _logger.i('Connected to $portName @ $baudRate baud');
       return true;
 
     } catch (e) {
       _logger.e('Connection error: $e');
-      _setState(ConnectionState.error);
+      _setState(SerialConnectionState.error);
       return false;
     }
   }
@@ -104,7 +104,7 @@ class SerialPortService implements ISerialService {
     _reader = null;
     _port = null;
 
-    _setState(ConnectionState.disconnected);
+    _setState(SerialConnectionState.disconnected);
     _logger.i('Disconnected');
   }
 
@@ -128,12 +128,12 @@ class SerialPortService implements ISerialService {
       }
     } catch (e) {
       _logger.e('Send error: $e');
-      _setState(ConnectionState.error);
+      _setState(SerialConnectionState.error);
       return false;
     }
   }
 
-  void _setState(ConnectionState state) {
+  void _setState(SerialConnectionState state) {
     _state = state;
     _stateController.add(state);
   }
@@ -149,11 +149,11 @@ class SerialPortService implements ISerialService {
 class MockSerialService implements ISerialService {
   final Logger _logger = Logger();
   final _packetController = StreamController<ProtocolPacket>.broadcast();
-  final _stateController = StreamController<ConnectionState>.broadcast();
+  final _stateController = StreamController<SerialConnectionState>.broadcast();
 
   bool _connected = false;
   Timer? _streamTimer;
-  ConnectionState _state = ConnectionState.disconnected;
+  SerialConnectionState _state = SerialConnectionState.disconnected;
 
   // Motor A state
   double _motorAPos = 0.0;
@@ -191,7 +191,7 @@ class MockSerialService implements ISerialService {
   Stream<ProtocolPacket> get packetStream => _packetController.stream;
 
   @override
-  Stream<ConnectionState> get connectionStateStream => _stateController.stream;
+  Stream<SerialConnectionState> get connectionStateStream => _stateController.stream;
 
   @override
   bool get isConnected => _connected;
@@ -203,7 +203,7 @@ class MockSerialService implements ISerialService {
   Future<bool> connect(String portName, {int baudRate = 115200}) async {
     await Future.delayed(const Duration(milliseconds: 300));
     _connected = true;
-    _setState(ConnectionState.connected);
+    _setState(SerialConnectionState.connected);
     _logger.i('Mock connected to $portName');
     _sendAck(ResponseCodes.SUCCESS);
     return true;
@@ -214,7 +214,7 @@ class MockSerialService implements ISerialService {
     _stopStream();
     _moveTimer?.cancel();
     _connected = false;
-    _setState(ConnectionState.disconnected);
+    _setState(SerialConnectionState.disconnected);
     _logger.i('Mock disconnected');
   }
 
@@ -448,7 +448,7 @@ class MockSerialService implements ISerialService {
     });
   }
 
-  void _setState(ConnectionState state) {
+  void _setState(SerialConnectionState state) {
     _state = state;
     _stateController.add(state);
   }

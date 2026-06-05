@@ -13,13 +13,13 @@ class DeviceRepository {
   StreamSubscription? _packetSubscription;
   
   final _statusController = StreamController<DeviceStatus>.broadcast();
-  final _connectionController = StreamController<ConnectionState>.broadcast();
+  final _connectionController = StreamController<SerialConnectionState>.broadcast();
   
   DeviceStatus _lastStatus = DeviceStatus(timestamp: DateTime.now());
   PIDParams _lastPID = const PIDParams();
   
   Stream<DeviceStatus> get statusStream => _statusController.stream;
-  Stream<ConnectionState> get connectionStream => _connectionController.stream;
+  Stream<SerialConnectionState> get connectionStream => _connectionController.stream;
   DeviceStatus get lastStatus => _lastStatus;
   PIDParams get lastPID => _lastPID;
   bool get isConnected => _serialService?.isConnected ?? false;

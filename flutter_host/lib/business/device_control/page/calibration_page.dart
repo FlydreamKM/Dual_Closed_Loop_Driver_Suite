@@ -24,7 +24,7 @@ class _CalibrationPageState extends ConsumerState<CalibrationPage> {
   @override
   Widget build(BuildContext context) {
     final calibrationState = ref.watch(calibrationProvider);
-    final isConnected = ref.watch(connectionStateProvider) == ConnectionState.connected;
+    final isConnected = ref.watch(connectionStateProvider) == SerialConnectionState.connected;
 
     return Scaffold(
       appBar: AppBar(title: const Text('Calibration')),

@@ -18,7 +18,7 @@ class _DashboardPageState extends ConsumerState<DashboardPage> {
   Widget build(BuildContext context) {
     final connectionState = ref.watch(connectionStateProvider);
     final deviceStatusAsync = ref.watch(deviceStatusProvider);
-    final isConnected = connectionState == ConnectionState.connected;
+    final isConnected = connectionState == SerialConnectionState.connected;
 
     return Scaffold(
       appBar: AppBar(
@@ -61,20 +61,20 @@ class _DashboardPageState extends ConsumerState<DashboardPage> {
     );
   }
 
-  Widget _buildConnectionIndicator(ConnectionState state) {
+  Widget _buildConnectionIndicator(SerialConnectionState state) {
     Color color;
     String label;
     
     switch (state) {
-      case ConnectionState.connected:
+      case SerialConnectionState.connected:
         color = Colors.green;
         label = 'Connected';
         break;
-      case ConnectionState.connecting:
+      case SerialConnectionState.connecting:
         color = Colors.orange;
         label = 'Connecting...';
         break;
-      case ConnectionState.error:
+      case SerialConnectionState.error:
         color = Colors.red;
         label = 'Error';
         break;

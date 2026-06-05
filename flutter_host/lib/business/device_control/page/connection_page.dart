@@ -21,7 +21,7 @@ class _ConnectionPageState extends ConsumerState<ConnectionPage> {
   Widget build(BuildContext context) {
     final connectionState = ref.watch(connectionStateProvider);
     final availablePorts = ref.read(connectionStateProvider.notifier).availablePorts;
-    final isConnected = connectionState == ConnectionState.connected;
+    final isConnected = connectionState == SerialConnectionState.connected;
 
     return Scaffold(
       appBar: AppBar(title: const Text('Connection Settings')),
@@ -99,26 +99,26 @@ class _ConnectionPageState extends ConsumerState<ConnectionPage> {
     );
   }
 
-  Widget _buildStatusCard(ConnectionState state) {
+  Widget _buildStatusCard(SerialConnectionState state) {
     Color color;
     String title;
     String subtitle;
     IconData icon;
 
     switch (state) {
-      case ConnectionState.connected:
+      case SerialConnectionState.connected:
         color = Colors.green;
         title = 'Connected';
         subtitle = 'Device communication active';
         icon = Icons.check_circle;
         break;
-      case ConnectionState.connecting:
+      case SerialConnectionState.connecting:
         color = Colors.orange;
         title = 'Connecting...';
         subtitle = 'Establishing connection';
         icon = Icons.hourglass_top;
         break;
-      case ConnectionState.error:
+      case SerialConnectionState.error:
         color = Colors.red;
         title = 'Error';
         subtitle = 'Connection failed';

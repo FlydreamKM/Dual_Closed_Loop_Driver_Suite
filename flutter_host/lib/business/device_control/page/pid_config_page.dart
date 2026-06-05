@@ -8,7 +8,7 @@ class PidConfigPage extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final pidParams = ref.watch(pidParamsProvider);
-    final isConnected = ref.watch(connectionStateProvider) == ConnectionState.connected;
+    final isConnected = ref.watch(connectionStateProvider) == SerialConnectionState.connected;
 
     return Scaffold(
       appBar: AppBar(title: const Text('PID Configuration')),
