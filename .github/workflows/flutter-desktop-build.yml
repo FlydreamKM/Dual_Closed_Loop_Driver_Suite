@@ -38,6 +38,7 @@ jobs:
         run: |
           flutter config --enable-linux-desktop
           flutter pub get
+          flutter create --platforms=linux .
           flutter build linux --release
 
       - name: Package Linux build
@@ -68,6 +69,7 @@ jobs:
         run: |
           flutter config --enable-windows-desktop
           flutter pub get
+          flutter create --platforms=windows .
           flutter build windows --release
 
       - name: Package Windows build
